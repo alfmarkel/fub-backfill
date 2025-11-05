@@ -1,274 +1,405 @@
+# fub_backfill.py
 import os
-import requests
-import psycopg2
-import hashlib
+import sys
+import json
+import time
+import base64
 import logging
 from datetime import datetime, timezone
-import urllib.parse as up
- 
-# ---------------------------------------------------------
-# CONFIG
-# ---------------------------------------------------------
-FUB_API_KEY = os.getenv("FUB_API_KEY")
-FUB_BASE_URL = "https://api.followupboss.com/v1/people"
+from typing import Dict, List, Optional, Tuple
 
-# ✅ Render-proof DB connection
-def get_db_connection():
-    db_url = os.getenv("DATABASE_URL")
-    if db_url:
-        up.uses_netloc.append("postgres")
-        url = up.urlparse(db_url)
-        return psycopg2.connect(
-            dbname=url.path[1:],
-            user=url.username,
-            password=url.password,
-            host=url.hostname,
-            port=url.port or 5432
-        )
-    # Fallback to individual vars (legacy)
-    return psycopg2.connect(
-        dbname=os.getenv("POSTGRES_DB"),
-        user=os.getenv("POSTGRES_USER"),
-        password=os.getenv("POSTGRES_PASSWORD"),
-        host=os.getenv("POSTGRES_HOST"),
-        port=os.getenv("POSTGRES_PORT", 5432)
-    )
+import requests
+import psycopg2
+from psycopg2.extras import execute_batch
 
-# ---------------------------------------------------------
-# LOGGING
-# ---------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
+# ------------------------------------------------------------------------------
+# Configuration
+# ------------------------------------------------------------------------------
+
+FUB_API_KEY = os.getenv("FUB_API_KEY") or os.getenv("FUB_KEY") or os.getenv("FUB_TOKEN")
+FUB_BASE = os.getenv("FUB_BASE_URL", "https://api.followupboss.com")
+FUB_LIMIT = int(os.getenv("FUB_PAGE_SIZE", "100"))
+
+DB_URL = (
+    os.getenv("DATABASE_URL")
+    or os.getenv("POSTGRES_URL")
+    or os.getenv("DB_URL")
+    or os.getenv("DATABASE_CONNECTION")
 )
 
-# ---------------------------------------------------------
-# DATABASE HELPERS
-# ---------------------------------------------------------
+# Quick sanity checks (we fail fast & clear in logs)
+if not FUB_API_KEY:
+    print("ERROR: FUB_API_KEY is not set in environment.", file=sys.stderr)
+    sys.exit(1)
+if not DB_URL:
+    print("ERROR: DATABASE_URL/DB_URL is not set in environment.", file=sys.stderr)
+    sys.exit(1)
+
+# Logging
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+
+# ------------------------------------------------------------------------------
+# DB helpers
+# ------------------------------------------------------------------------------
+
+def get_db_connection():
+    """
+    Always connect via TCP using the provided URL, with SSL required (Render/managed PG).
+    """
+    conn = psycopg2.connect(DB_URL, sslmode="require")
+    conn.autocommit = False
+    return conn
+
+
 def ensure_schema(conn):
+    """
+    You already created tables. We just sanity-check they exist and have the key columns.
+    (No destructive DDL here.)
+    """
     with conn.cursor() as cur:
         cur.execute("""
-        CREATE TABLE IF NOT EXISTS contacts_master (
-            fub_id BIGINT PRIMARY KEY,
-            first_name TEXT,
-            last_name TEXT,
-            email TEXT,
-            phone TEXT,
-            street TEXT,
-            city TEXT,
-            state TEXT,
-            zip TEXT,
-            stage TEXT,
-            source TEXT,
-            fub_url TEXT,
-            ghl_url TEXT,
-            last_sync TIMESTAMPTZ
-        );
+            CREATE TABLE IF NOT EXISTS contacts_master (
+                fub_id BIGINT PRIMARY KEY,
+                first_name TEXT,
+                last_name TEXT,
+                email TEXT,
+                phone TEXT,
+                street TEXT,
+                city TEXT,
+                state TEXT,
+                zip TEXT,
+                stage TEXT,
+                source TEXT,
+                fub_url TEXT,
+                ghl_url TEXT,
+                last_sync TIMESTAMP
+            );
         """)
         cur.execute("""
-        CREATE TABLE IF NOT EXISTS contact_hashes (
-            fub_id BIGINT PRIMARY KEY,
-            full_hash TEXT,
-            partial_fub TEXT,
-            last_update TIMESTAMPTZ
-        );
+            CREATE TABLE IF NOT EXISTS contact_hashes (
+                fub_id BIGINT PRIMARY KEY,
+                full_hash TEXT,
+                partial_fub TEXT,
+                last_update TIMESTAMP
+            );
         """)
         cur.execute("""
-        CREATE TABLE IF NOT EXISTS sync_logs (
-            id SERIAL PRIMARY KEY,
-            fub_id BIGINT,
-            action TEXT,
-            origin TEXT,
-            timestamp TIMESTAMPTZ,
-            notes TEXT
-        );
+            CREATE TABLE IF NOT EXISTS sync_logs (
+                id BIGSERIAL PRIMARY KEY,
+                fub_id BIGINT,
+                action TEXT,
+                origin TEXT,
+                timestamp TIMESTAMP,
+                notes TEXT
+            );
         """)
-        conn.commit()
-        logging.info("✅ Verified schema exists.")
+    conn.commit()
+    logging.info("✅ Verified schema exists.")
 
 
-def compute_contact_hash(contact):
-    key_fields = [
-        contact.get("firstName", ""),
-        contact.get("lastName", ""),
-        contact.get("primaryEmail", ""),
-        contact.get("primaryPhoneNumber", "")
-    ]
-    return hashlib.sha256("|".join(key_fields).encode()).hexdigest()
+# ------------------------------------------------------------------------------
+# FUB API
+# ------------------------------------------------------------------------------
+
+def fub_headers() -> Dict[str, str]:
+    # Use Basic auth (key as username / blank password). requests can do auth=, but we keep
+    # a header here so we’re explicit and easy to debug.
+    token = base64.b64encode(f"{FUB_API_KEY}:".encode("utf-8")).decode("ascii")
+    return {
+        "Authorization": f"Basic {token}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
 
 
-def compute_partial_hash(contact):
-    return hashlib.md5(
-        (contact.get("primaryEmail", "") + contact.get("primaryPhoneNumber", "")).encode()
-    ).hexdigest()
+def fetch_contacts_cursor(cursor: Optional[str], limit: int) -> Tuple[List[dict], Optional[str]]:
+    """
+    Cursor-first fetch. If FUB returns a `nextCursor`, we’ll use it. If not, we’ll
+    return None for the next cursor and the caller can decide what to do.
+    """
+    url = f"{FUB_BASE.rstrip('/')}/v1/people"
+    params = {"limit": limit}
+    if cursor:
+        params["cursor"] = cursor
+
+    resp = requests.get(url, headers=fub_headers(), params=params, timeout=30)
+    if resp.status_code != 200:
+        logging.error(f"❌ FUB API {resp.status_code}: {resp.text}")
+        return [], None
+
+    data = resp.json() if resp.text else {}
+    people = data.get("people") or data.get("items") or data.get("contacts") or []
+    next_cursor = data.get("nextCursor") or data.get("next_cursor") or None
+
+    logging.info(f"Fetched → {len(people)} contacts (next_cursor={'set' if next_cursor else 'None'})")
+    return people, next_cursor
 
 
-def get_existing_hashes(conn, fub_ids):
+def fetch_contacts_page(page: int, limit: int) -> List[dict]:
+    """
+    Page fallback (if the API doesn’t give a cursor). Some deployments of FUB still
+    honor page+limit; others do not. We use this ONLY if cursor isn’t present.
+    """
+    url = f"{FUB_BASE.rstrip('/')}/v1/people"
+    params = {"limit": limit, "page": page}
+
+    resp = requests.get(url, headers=fub_headers(), params=params, timeout=30)
+    if resp.status_code != 200:
+        logging.error(f"❌ FUB API {resp.status_code}: {resp.text}")
+        return []
+    data = resp.json() if resp.text else {}
+    people = data.get("people") or data.get("items") or data.get("contacts") or []
+    logging.info(f"Fetched page {page} → {len(people)} contacts (hasMore=n/a)")
+    return people
+
+
+# ------------------------------------------------------------------------------
+# Hashing & change detection
+# ------------------------------------------------------------------------------
+
+def compute_contact_hash(c: dict) -> str:
+    """
+    Full content hash for change detection (stable ordering / trimmed fields).
+    """
+    body = {
+        "id": c.get("id"),
+        "first": (c.get("firstName") or "").strip(),
+        "last": (c.get("lastName") or "").strip(),
+        "email": (c.get("primaryEmail") or "").strip(),
+        "phone": (c.get("primaryPhoneNumber") or "").strip(),
+        "address": {
+            "street": (c.get("primaryAddress", {}) or {}).get("street", "") if c.get("primaryAddress") else "",
+            "city": (c.get("primaryAddress", {}) or {}).get("city", "") if c.get("primaryAddress") else "",
+            "state": (c.get("primaryAddress", {}) or {}).get("state", "") if c.get("primaryAddress") else "",
+            "zip": (c.get("primaryAddress", {}) or {}).get("postalCode", "") if c.get("primaryAddress") else "",
+        },
+        "stage": (c.get("stage") or "").strip(),
+        "source": (c.get("source") or "").strip(),
+        "url": (c.get("url") or "").strip(),
+    }
+    as_bytes = json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    import hashlib
+    return hashlib.sha256(as_bytes).hexdigest()
+
+
+def compute_partial_hash(c: dict) -> str:
+    """
+    Smaller fingerprint we can also store (e.g., name+email+phone).
+    """
+    body = {
+        "first": (c.get("firstName") or "").strip(),
+        "last": (c.get("lastName") or "").strip(),
+        "email": (c.get("primaryEmail") or "").strip(),
+        "phone": (c.get("primaryPhoneNumber") or "").strip(),
+    }
+    as_bytes = json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    import hashlib
+    return hashlib.md5(as_bytes).hexdigest()
+
+
+def get_existing_hashes(conn, fub_ids: List[int]) -> Dict[int, str]:
     if not fub_ids:
         return {}
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT fub_id, full_hash FROM contact_hashes WHERE fub_id = ANY(%s);",
-            (fub_ids,)
+            "SELECT fub_id, full_hash FROM contact_hashes WHERE fub_id = ANY(%s)",
+            (fub_ids,),
         )
-        return {row[0]: row[1] for row in cur.fetchall()}
+        rows = cur.fetchall()
+    return {int(r[0]): r[1] for r in rows}
 
 
-def bulk_upsert(conn, contacts, hashes, logs):
+# ------------------------------------------------------------------------------
+# Writes
+# ------------------------------------------------------------------------------
+
+INSERT_CONTACT_SQL = """
+INSERT INTO contacts_master (
+    fub_id, first_name, last_name, email, phone,
+    street, city, state, zip, stage, source, fub_url, ghl_url, last_sync
+) VALUES (
+    %(fub_id)s, %(first_name)s, %(last_name)s, %(email)s, %(phone)s,
+    %(street)s, %(city)s, %(state)s, %(zip)s, %(stage)s, %(source)s, %(fub_url)s, %(ghl_url)s, %(last_sync)s
+)
+ON CONFLICT (fub_id) DO UPDATE SET
+    first_name = EXCLUDED.first_name,
+    last_name  = EXCLUDED.last_name,
+    email      = EXCLUDED.email,
+    phone      = EXCLUDED.phone,
+    street     = EXCLUDED.street,
+    city       = EXCLUDED.city,
+    state      = EXCLUDED.state,
+    zip        = EXCLUDED.zip,
+    stage      = EXCLUDED.stage,
+    source     = EXCLUDED.source,
+    fub_url    = EXCLUDED.fub_url,
+    ghl_url    = COALESCE(contacts_master.ghl_url, EXCLUDED.ghl_url),
+    last_sync  = EXCLUDED.last_sync;
+"""
+
+INSERT_HASH_SQL = """
+INSERT INTO contact_hashes (fub_id, full_hash, partial_fub, last_update)
+VALUES (%(fub_id)s, %(full_hash)s, %(partial_fub)s, %(last_update)s)
+ON CONFLICT (fub_id) DO UPDATE SET
+    full_hash   = EXCLUDED.full_hash,
+    partial_fub = EXCLUDED.partial_fub,
+    last_update = EXCLUDED.last_update;
+"""
+
+INSERT_LOG_SQL = """
+INSERT INTO sync_logs (fub_id, action, origin, timestamp, notes)
+VALUES (%(fub_id)s, %(action)s, %(origin)s, %(timestamp)s, %(notes)s);
+"""
+
+
+def bulk_upsert(conn, contacts: List[dict], hashes: List[dict], logs: List[dict]):
     with conn.cursor() as cur:
-        for c in contacts:
-            cur.execute("""
-                INSERT INTO contacts_master (
-                    fub_id, first_name, last_name, email, phone, street, city, state, zip,
-                    stage, source, fub_url, ghl_url, last_sync
-                )
-                VALUES (%(fub_id)s, %(first_name)s, %(last_name)s, %(email)s, %(phone)s,
-                        %(street)s, %(city)s, %(state)s, %(zip)s, %(stage)s, %(source)s,
-                        %(fub_url)s, %(ghl_url)s, %(last_sync)s)
-                ON CONFLICT (fub_id) DO UPDATE SET
-                    first_name=EXCLUDED.first_name,
-                    last_name=EXCLUDED.last_name,
-                    email=EXCLUDED.email,
-                    phone=EXCLUDED.phone,
-                    street=EXCLUDED.street,
-                    city=EXCLUDED.city,
-                    state=EXCLUDED.state,
-                    zip=EXCLUDED.zip,
-                    stage=EXCLUDED.stage,
-                    source=EXCLUDED.source,
-                    fub_url=EXCLUDED.fub_url,
-                    last_sync=EXCLUDED.last_sync;
-            """, c)
-
-        for h in hashes:
-            cur.execute("""
-                INSERT INTO contact_hashes (fub_id, full_hash, partial_fub, last_update)
-                VALUES (%(fub_id)s, %(full_hash)s, %(partial_fub)s, %(last_update)s)
-                ON CONFLICT (fub_id) DO UPDATE SET
-                    full_hash=EXCLUDED.full_hash,
-                    partial_fub=EXCLUDED.partial_fub,
-                    last_update=EXCLUDED.last_update;
-            """, h)
-
-        for l in logs:
-            cur.execute("""
-                INSERT INTO sync_logs (fub_id, action, origin, timestamp, notes)
-                VALUES (%(fub_id)s, %(action)s, %(origin)s, %(timestamp)s, %(notes)s);
-            """, l)
-
-        conn.commit()
+        if contacts:
+            execute_batch(cur, INSERT_CONTACT_SQL, contacts, page_size=500)
+        if hashes:
+            execute_batch(cur, INSERT_HASH_SQL, hashes, page_size=500)
+        if logs:
+            execute_batch(cur, INSERT_LOG_SQL, logs, page_size=500)
+    conn.commit()
+    if contacts or hashes or logs:
         logging.info(f"✅ Wrote {len(contacts)} contacts, {len(hashes)} hashes, {len(logs)} logs.")
 
 
-# ---------------------------------------------------------
-# FUB API CALLS
-# ---------------------------------------------------------
-def get_fub_contacts(page: int):
-    headers = {"Accept": "application/json"}
-    response = requests.get(
-        FUB_BASE_URL,
-        auth=(FUB_API_KEY, ""),
-        params={"page": page, "limit": 100}
-    )
-    if response.status_code != 200:
-        logging.error(f"❌ FUB API {response.status_code}: {response.text}")
-        return None
-    data = response.json()
-    return data.get("people", [])
+# ------------------------------------------------------------------------------
+# Runner
+# ------------------------------------------------------------------------------
 
-
-# ---------------------------------------------------------
-# MAIN BACKFILL
-# ---------------------------------------------------------
 def run_backfill():
+    """
+    Full backfill with cursor-first pagination (falls back to page if cursor is absent).
+    Per-run counters are included in logs (reset each execution).
+    """
     run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     logging.info(f"🚀 Starting FUB → Render backfill [RUN {run_id}]")
+
     conn = get_db_connection()
     ensure_schema(conn)
 
     total_processed = 0
     total_changed = 0
+
     page = 1
-    max_pages = 200  # enough for ~20,000 records
+    cursor = None
+    used_cursor = False
+    safety_max = int(os.getenv("MAX_PAGES", "2000"))  # hard cap so we never loop forever
 
     try:
-        while page <= max_pages:
-            contacts = get_fub_contacts(page)
-            if not contacts:
-                logging.info(f"[RUN {run_id}] No more contacts at page {page}. Ending.")
+        for _ in range(safety_max):
+            # 1) Prefer cursor paging
+            people, next_cursor = fetch_contacts_cursor(cursor, FUB_LIMIT)
+
+            if people:
+                used_cursor = True
+            else:
+                # If cursor gave nothing AND we're on the first loop, try page fallback
+                if cursor is None and page == 1:
+                    people = fetch_contacts_page(page, FUB_LIMIT)
+                else:
+                    # Cursor pagination says we’re done
+                    break
+
+            if not people:
+                logging.info(f"[RUN {run_id}] No more contacts to process. Ending.")
                 break
 
-            fub_ids = [c["id"] for c in contacts if "id" in c]
-            existing_hashes = get_existing_hashes(conn, fub_ids)
-            contacts_batch, hashes_batch, logs_batch = [], [], []
-            changed_count = 0
+            fub_ids = [p.get("id") for p in people if p.get("id") is not None]
+            existing = get_existing_hashes(conn, fub_ids)
 
-            for c in contacts:
-                fub_id = c["id"]
+            contacts_batch: List[dict] = []
+            hashes_batch: List[dict] = []
+            logs_batch: List[dict] = []
+
+            changed = 0
+            now = datetime.now(timezone.utc)
+
+            for c in people:
+                fub_id = c.get("id")
+                if fub_id is None:
+                    continue
+
                 full_hash = compute_contact_hash(c)
-                old_hash = existing_hashes.get(fub_id)
+                if existing.get(int(fub_id)) != full_hash:
+                    changed += 1
 
-                if old_hash != full_hash:
-                    changed_count += 1
                     contact_row = {
                         "fub_id": fub_id,
-                        "first_name": c.get("firstName", ""),
-                        "last_name": c.get("lastName", ""),
-                        "email": c.get("primaryEmail", ""),
-                        "phone": c.get("primaryPhoneNumber", ""),
-                        "street": c.get("primaryAddress", {}).get("street", "") if c.get("primaryAddress") else "",
-                        "city": c.get("primaryAddress", {}).get("city", "") if c.get("primaryAddress") else "",
-                        "state": c.get("primaryAddress", {}).get("state", "") if c.get("primaryAddress") else "",
-                        "zip": c.get("primaryAddress", {}).get("postalCode", "") if c.get("primaryAddress") else "",
-                        "stage": c.get("stage", ""),
-                        "source": c.get("source", ""),
-                        "fub_url": c.get("url", ""),
+                        "first_name": (c.get("firstName") or "").strip(),
+                        "last_name": (c.get("lastName") or "").strip(),
+                        "email": (c.get("primaryEmail") or "").strip(),
+                        "phone": (c.get("primaryPhoneNumber") or "").strip(),
+                        "street": (c.get("primaryAddress") or {}).get("street", "") if c.get("primaryAddress") else "",
+                        "city": (c.get("primaryAddress") or {}).get("city", "") if c.get("primaryAddress") else "",
+                        "state": (c.get("primaryAddress") or {}).get("state", "") if c.get("primaryAddress") else "",
+                        "zip": (c.get("primaryAddress") or {}).get("postalCode", "") if c.get("primaryAddress") else "",
+                        "stage": (c.get("stage") or "").strip(),
+                        "source": (c.get("source") or "").strip(),
+                        "fub_url": (c.get("url") or "").strip(),
                         "ghl_url": None,
-                        "last_sync": datetime.now(timezone.utc)
+                        "last_sync": now,
                     }
                     hash_row = {
                         "fub_id": fub_id,
                         "full_hash": full_hash,
                         "partial_fub": compute_partial_hash(c),
-                        "last_update": datetime.now(timezone.utc)
+                        "last_update": now,
                     }
                     log_row = {
                         "fub_id": fub_id,
                         "action": "UPSERT",
-                        "origin": "backfill",
-                        "timestamp": datetime.now(timezone.utc),
-                        "notes": f"Updated contact {fub_id}"
+                        "origin": f"backfill:{run_id}",
+                        "timestamp": now,
+                        "notes": f"Updated contact {fub_id}",
                     }
 
                     contacts_batch.append(contact_row)
                     hashes_batch.append(hash_row)
                     logs_batch.append(log_row)
 
-            if changed_count > 0:
+            if changed > 0:
                 bulk_upsert(conn, contacts_batch, hashes_batch, logs_batch)
-                total_changed += changed_count
+                total_changed += changed
 
-            total_processed += len(contacts)
+            total_processed += len(people)
+            where = f"Page {page:>3}" if not used_cursor else f"Cursor {('START' if cursor is None else cursor[:8]+'…')}"
             logging.info(
-                f"[RUN {run_id}] Page {page:>3}: processed={len(contacts):<4} changed={changed_count:<4} "
+                f"[RUN {run_id}] {where}: processed={len(people):<4} changed={changed:<4} "
                 f"→ total_processed={total_processed:<6} total_changed={total_changed:<6}"
             )
 
-            if len(contacts) < 100:
-                logging.info(f"[RUN {run_id}] Reached end of available contacts.")
-                break
-
-            page += 1
+            # Pagination advance
+            if used_cursor:
+                cursor = next_cursor
+                if not cursor:
+                    logging.info(f"[RUN {run_id}] Reached end (no next cursor).")
+                    break
+            else:
+                # Page fallback
+                page += 1
+                if len(people) < FUB_LIMIT:
+                    logging.info(f"[RUN {run_id}] Reached end (short page).")
+                    break
 
         logging.info(f"✅ [RUN {run_id}] Backfill complete: total_processed={total_processed}, total_changed={total_changed}")
 
     except Exception as e:
         logging.exception(f"Backfill failed: {e}")
+        conn.rollback()
     finally:
-        conn.close()
-        logging.info(f"[RUN {run_id}] Database connection closed.")
+        try:
+            conn.close()
+            logging.info(f"[RUN {run_id}] Database connection closed.")
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
+    # When Render runs `python fub_backfill.py && sleep 5`, we just run once and exit.
     run_backfill()
-
