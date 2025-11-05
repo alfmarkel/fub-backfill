@@ -24,6 +24,7 @@ if not FUB_API_KEY:
     raise RuntimeError("❌ FUB_API_KEY is missing from environment variables.")
 
 PAGE_SIZE = 100
+MAX_PAGES = 500
 
 
 # ---------------------------------------------------------------------------
@@ -191,15 +192,13 @@ def compute_partial_hash(contact):
 
 
 # ---------------------------------------------------------------------------
-# FUB API with cursor pagination
+# FUB API using page parameter
 # ---------------------------------------------------------------------------
 
-def get_fub_contacts(cursor=None):
-    """Fetch contacts from Follow Up Boss API using cursor-based pagination."""
+def get_fub_contacts(page):
+    """Fetch contacts from FUB using the working page/limit system."""
     url = "https://api.followupboss.com/v1/people"
-    params = {"limit": PAGE_SIZE}
-    if cursor:
-        params["cursor"] = cursor
+    params = {"limit": PAGE_SIZE, "page": page}
 
     try:
         resp = requests.get(
@@ -210,17 +209,16 @@ def get_fub_contacts(cursor=None):
         )
         if resp.status_code != 200:
             logging.error(f"❌ FUB API {resp.status_code}: {resp.text[:300]}")
-            return [], None
+            return []
 
         data = resp.json()
         contacts = data.get("people") or data.get("contacts") or []
-        next_cursor = data.get("next") or data.get("cursor") or None
-        logging.info(f"Fetched → {len(contacts)} contacts (next_cursor={next_cursor})")
-        return contacts, next_cursor
+        logging.info(f"Fetched page {page} → {len(contacts)} contacts")
+        return contacts
 
     except Exception as e:
-        logging.exception(f"Error fetching contacts: {e}")
-        return [], None
+        logging.exception(f"Error fetching page {page}: {e}")
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -236,20 +234,18 @@ def run_backfill():
 
     total_processed = 0
     total_changed = 0
-    cursor = None
 
     try:
-        while True:
-            contacts, cursor = get_fub_contacts(cursor)
+        for page in range(1, MAX_PAGES + 1):
+            contacts = get_fub_contacts(page)
             if not contacts:
+                logging.info(f"[RUN {run_id}] No more contacts at page {page}. Ending.")
                 break
 
             fub_ids = [c.get("id") for c in contacts if c.get("id")]
-            if not fub_ids:
-                continue
-
             existing_hashes = get_existing_hashes(conn, fub_ids)
             existing_master = get_existing_master_ids(conn, fub_ids)
+
             contacts_batch, hashes_batch, logs_batch = [], [], []
             changed_count = 0
 
@@ -303,15 +299,17 @@ def run_backfill():
 
             total_processed += len(contacts)
             logging.info(
-                f"[RUN {run_id}] processed={len(contacts):<4} changed={changed_count:<4} "
+                f"[RUN {run_id}] Page {page:>3}: processed={len(contacts):<4} changed={changed_count:<4} "
                 f"⇢ total_processed={total_processed:<6} total_changed={total_changed:<6}"
             )
 
-            if not cursor:
+            if len(contacts) < PAGE_SIZE:
                 logging.info(f"[RUN {run_id}] Reached end of available contacts.")
                 break
 
-        logging.info(f"✅ [RUN {run_id}] Backfill complete: total_processed={total_processed}, total_changed={total_changed}")
+        logging.info(
+            f"✅ [RUN {run_id}] Backfill complete: total_processed={total_processed}, total_changed={total_changed}"
+        )
 
     except Exception as e:
         logging.exception(f"❌ [RUN {run_id}] Backfill failed: {e}")
@@ -323,4 +321,3 @@ def run_backfill():
 
 if __name__ == "__main__":
     run_backfill()
-
