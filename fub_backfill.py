@@ -24,7 +24,6 @@ if not FUB_API_KEY:
     raise RuntimeError("❌ FUB_API_KEY is missing from environment variables.")
 
 PAGE_SIZE = 100
-MAX_PAGES = 500
 
 
 # ---------------------------------------------------------------------------
@@ -87,7 +86,6 @@ def get_existing_hashes(conn, fub_ids):
 
 
 def get_existing_master_ids(conn, fub_ids):
-    """Return a set of fub_ids that already exist in contacts_master."""
     if not fub_ids:
         return set()
     sql = "SELECT fub_id FROM contacts_master WHERE fub_id = ANY(%s)"
@@ -180,8 +178,7 @@ def compute_contact_hash(contact):
         str(contact.get("primaryAddress", {}).get("state", "")),
         str(contact.get("primaryAddress", {}).get("postalCode", "")),
     ]
-    joined = "|".join(key_fields)
-    return hashlib.sha256(joined.encode("utf-8")).hexdigest()
+    return hashlib.sha256("|".join(key_fields).encode("utf-8")).hexdigest()
 
 
 def compute_partial_hash(contact):
@@ -190,40 +187,40 @@ def compute_partial_hash(contact):
         contact.get("lastName", ""),
         contact.get("primaryEmail", ""),
     ]
-    joined = "|".join(key_fields)
-    return hashlib.md5(joined.encode("utf-8")).hexdigest()
+    return hashlib.md5("|".join(key_fields).encode("utf-8")).hexdigest()
 
 
 # ---------------------------------------------------------------------------
-# FUB API
+# FUB API with cursor pagination
 # ---------------------------------------------------------------------------
 
-def get_fub_contacts(page: int):
+def get_fub_contacts(cursor=None):
+    """Fetch contacts from Follow Up Boss API using cursor-based pagination."""
     url = "https://api.followupboss.com/v1/people"
-    params = {"page": page, "limit": PAGE_SIZE}
+    params = {"limit": PAGE_SIZE}
+    if cursor:
+        params["cursor"] = cursor
 
     try:
         resp = requests.get(
             url,
             params=params,
-            auth=(FUB_API_KEY, ""),  # verified working auth
-            timeout=30
+            auth=(FUB_API_KEY, ""),
+            timeout=30,
         )
         if resp.status_code != 200:
             logging.error(f"❌ FUB API {resp.status_code}: {resp.text[:300]}")
-            return []
+            return [], None
 
         data = resp.json()
         contacts = data.get("people") or data.get("contacts") or []
-        logging.info(
-            f"Fetched page {page} → {len(contacts)} contacts "
-            f"(hasMore={data.get('hasMore', 'n/a')})"
-        )
-        return contacts
+        next_cursor = data.get("next") or data.get("cursor") or None
+        logging.info(f"Fetched → {len(contacts)} contacts (next_cursor={next_cursor})")
+        return contacts, next_cursor
 
     except Exception as e:
-        logging.exception(f"Error fetching page {page}: {e}")
-        return []
+        logging.exception(f"Error fetching contacts: {e}")
+        return [], None
 
 
 # ---------------------------------------------------------------------------
@@ -239,22 +236,20 @@ def run_backfill():
 
     total_processed = 0
     total_changed = 0
+    cursor = None
 
     try:
-        for page in range(1, MAX_PAGES + 1):
-            contacts = get_fub_contacts(page)
+        while True:
+            contacts, cursor = get_fub_contacts(cursor)
             if not contacts:
-                logging.info(f"[RUN {run_id}] No more contacts at page {page}. Ending.")
                 break
 
             fub_ids = [c.get("id") for c in contacts if c.get("id")]
             if not fub_ids:
                 continue
 
-            # presence in both places
             existing_hashes = get_existing_hashes(conn, fub_ids)
             existing_master = get_existing_master_ids(conn, fub_ids)
-
             contacts_batch, hashes_batch, logs_batch = [], [], []
             changed_count = 0
 
@@ -262,12 +257,10 @@ def run_backfill():
                 fub_id = c["id"]
                 full_hash = compute_contact_hash(c)
                 old_hash = existing_hashes.get(fub_id)
-                is_missing_master = fub_id not in existing_master
+                missing_master = fub_id not in existing_master
 
-                # treat as change if row missing in master OR hash changed
-                if is_missing_master or (full_hash != old_hash):
+                if missing_master or full_hash != old_hash:
                     changed_count += 1
-
                     contact_row = {
                         "fub_id": fub_id,
                         "first_name": c.get("firstName", ""),
@@ -294,10 +287,10 @@ def run_backfill():
 
                     log_row = {
                         "fub_id": fub_id,
-                        "action": "UPSERT" if is_missing_master else "UPDATE",
+                        "action": "UPSERT" if missing_master else "UPDATE",
                         "origin": "backfill",
                         "timestamp": datetime.now(timezone.utc),
-                        "notes": ("Inserted new master row" if is_missing_master else "Hash changed"),
+                        "notes": "Inserted new master row" if missing_master else "Hash changed",
                     }
 
                     contacts_batch.append(contact_row)
@@ -310,17 +303,15 @@ def run_backfill():
 
             total_processed += len(contacts)
             logging.info(
-                f"[RUN {run_id}] Page {page:>3}: processed={len(contacts):<4} changed={changed_count:<4} "
+                f"[RUN {run_id}] processed={len(contacts):<4} changed={changed_count:<4} "
                 f"⇢ total_processed={total_processed:<6} total_changed={total_changed:<6}"
             )
 
-            if len(contacts) < PAGE_SIZE:
+            if not cursor:
                 logging.info(f"[RUN {run_id}] Reached end of available contacts.")
                 break
 
-        logging.info(
-            f"✅ [RUN {run_id}] Backfill complete: total_processed={total_processed}, total_changed={total_changed}"
-        )
+        logging.info(f"✅ [RUN {run_id}] Backfill complete: total_processed={total_processed}, total_changed={total_changed}")
 
     except Exception as e:
         logging.exception(f"❌ [RUN {run_id}] Backfill failed: {e}")
