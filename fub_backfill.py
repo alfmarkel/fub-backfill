@@ -3,7 +3,7 @@ import logging
 import psycopg2
 from psycopg2.extras import execute_batch
 import requests
-from datetime import datetime
+from datetime import datetime, timezone
 import hashlib
 
 # ---------------------------------------------------------------------------
@@ -15,7 +15,6 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 
-# Environment variables (Render → Environment)
 DB_URL = os.getenv("DATABASE_URL")
 FUB_API_KEY = os.getenv("FUB_API_KEY")
 
@@ -33,14 +32,12 @@ MAX_PAGES = 500
 # ---------------------------------------------------------------------------
 
 def get_db_connection():
-    """Connect to PostgreSQL using psycopg2"""
     conn = psycopg2.connect(DB_URL)
     conn.autocommit = True
     return conn
 
 
 def ensure_schema(conn):
-    """Ensure tables exist with correct structure"""
     schema_sql = """
     CREATE TABLE IF NOT EXISTS contacts_master (
         fub_id BIGINT PRIMARY KEY,
@@ -85,7 +82,6 @@ def ensure_schema(conn):
 # ---------------------------------------------------------------------------
 
 def compute_contact_hash(contact):
-    """Compute a stable hash of the main fields for change tracking."""
     key_fields = [
         contact.get("firstName", ""),
         contact.get("lastName", ""),
@@ -103,7 +99,6 @@ def compute_contact_hash(contact):
 
 
 def compute_partial_hash(contact):
-    """Compute a smaller hash for FUB-only data."""
     key_fields = [
         contact.get("firstName", ""),
         contact.get("lastName", ""),
@@ -114,20 +109,22 @@ def compute_partial_hash(contact):
 
 
 # ---------------------------------------------------------------------------
-# API FUNCTIONS
+# FUB API ACCESS (using verified working auth)
 # ---------------------------------------------------------------------------
 
 def get_fub_contacts(page: int):
-    """Fetch one page of contacts from Follow Up Boss"""
+    """Fetch one page of contacts from Follow Up Boss API."""
     url = "https://api.followupboss.com/v1/people"
     params = {"page": page, "limit": PAGE_SIZE}
-    headers = {
-        "Authorization": f"Basic {FUB_API_KEY}",
-        "Accept": "application/json",
-    }
 
     try:
-        response = requests.get(url, headers=headers, params=params, timeout=30)
+        response = requests.get(
+            url,
+            params=params,
+            auth=(FUB_API_KEY, ""),  # ✅ WORKING METHOD
+            timeout=30
+        )
+
         if response.status_code != 200:
             logging.error(f"❌ FUB API {response.status_code}: {response.text[:300]}")
             return []
@@ -149,7 +146,6 @@ def get_fub_contacts(page: int):
 # ---------------------------------------------------------------------------
 
 def get_existing_hashes(conn, fub_ids):
-    """Get existing hashes for given FUB IDs"""
     if not fub_ids:
         return {}
     sql = "SELECT fub_id, full_hash FROM contact_hashes WHERE fub_id = ANY(%s)"
@@ -159,7 +155,6 @@ def get_existing_hashes(conn, fub_ids):
 
 
 def bulk_upsert(conn, contacts_batch, hashes_batch, logs_batch):
-    """Perform bulk upserts for contacts, hashes, and logs."""
     with conn.cursor() as cur:
         execute_batch(
             cur,
@@ -228,9 +223,7 @@ def bulk_upsert(conn, contacts_batch, hashes_batch, logs_batch):
 # ---------------------------------------------------------------------------
 
 def run_backfill():
-    """Full backfill process with accumulative counters and run ID."""
-
-    run_id = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     logging.info(f"🚀 Starting FUB → Render backfill [RUN {run_id}]")
 
     conn = get_db_connection()
@@ -276,21 +269,21 @@ def run_backfill():
                         "source": c.get("source", ""),
                         "fub_url": c.get("url", ""),
                         "ghl_url": None,
-                        "last_sync": datetime.utcnow(),
+                        "last_sync": datetime.now(timezone.utc),
                     }
 
                     hash_row = {
                         "fub_id": fub_id,
                         "full_hash": full_hash,
                         "partial_fub": compute_partial_hash(c),
-                        "last_update": datetime.utcnow(),
+                        "last_update": datetime.now(timezone.utc),
                     }
 
                     log_row = {
                         "fub_id": fub_id,
                         "action": "UPSERT",
                         "origin": "backfill",
-                        "timestamp": datetime.utcnow(),
+                        "timestamp": datetime.now(timezone.utc),
                         "notes": f"Updated contact {fub_id}",
                     }
 
