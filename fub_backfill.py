@@ -1,238 +1,267 @@
-import os, logging, psycopg2, requests, hashlib
-from psycopg2.extras import execute_batch
+import os
+import requests
+import psycopg2
+import hashlib
+import logging
 from datetime import datetime, timezone
 
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------
 # CONFIG
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------
+FUB_API_KEY = os.getenv("FUB_API_KEY")
+FUB_BASE_URL = "https://api.followupboss.com/v1/people"
+
+DB_CONN = {
+    "dbname": os.getenv("POSTGRES_DB"),
+    "user": os.getenv("POSTGRES_USER"),
+    "password": os.getenv("POSTGRES_PASSWORD"),
+    "host": os.getenv("POSTGRES_HOST"),
+    "port": os.getenv("POSTGRES_PORT", 5432)
+}
+
+# ---------------------------------------------------------
+# LOGGING
+# ---------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 
-DB_URL = os.getenv("DATABASE_URL")
-FUB_API_KEY = os.getenv("FUB_API_KEY")
-PAGE_SIZE, MAX_PAGES, BATCH_LOOKUP = 100, 2000, 5000
-
-if not DB_URL:
-    raise RuntimeError("❌ DATABASE_URL not set")
-if not FUB_API_KEY:
-    raise RuntimeError("❌ FUB_API_KEY not set")
-
-# ---------------------------------------------------------------------------
-# DB HELPERS
-# ---------------------------------------------------------------------------
-def get_db():
-    c = psycopg2.connect(DB_URL)
-    c.autocommit = True
-    return c
+# ---------------------------------------------------------
+# DATABASE HELPERS
+# ---------------------------------------------------------
+def get_db_connection():
+    return psycopg2.connect(**DB_CONN)
 
 def ensure_schema(conn):
-    sql = """
-    CREATE TABLE IF NOT EXISTS contacts_master(
-      fub_id BIGINT PRIMARY KEY,
-      first_name TEXT, last_name TEXT, email TEXT, phone TEXT,
-      street TEXT, city TEXT, state TEXT, zip TEXT,
-      fub_url TEXT, ghl_url TEXT,
-      stage TEXT, source TEXT,
-      last_sync TIMESTAMP
-    );
-
-    CREATE TABLE IF NOT EXISTS contact_hashes(
-      fub_id BIGINT PRIMARY KEY,
-      full_hash TEXT, partial_fub TEXT, last_update TIMESTAMP
-    );
-
-    CREATE TABLE IF NOT EXISTS sync_logs(
-      id BIGSERIAL PRIMARY KEY,
-      fub_id BIGINT,
-      action TEXT,
-      origin TEXT,
-      timestamp TIMESTAMP,
-      notes TEXT
-    );
-    """
     with conn.cursor() as cur:
-        cur.execute(sql)
-    logging.info("✅ Verified schema exists.")
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS contacts_master (
+            fub_id BIGINT PRIMARY KEY,
+            first_name TEXT,
+            last_name TEXT,
+            email TEXT,
+            phone TEXT,
+            street TEXT,
+            city TEXT,
+            state TEXT,
+            zip TEXT,
+            stage TEXT,
+            source TEXT,
+            fub_url TEXT,
+            ghl_url TEXT,
+            last_sync TIMESTAMPTZ
+        );
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS contact_hashes (
+            fub_id BIGINT PRIMARY KEY,
+            full_hash TEXT,
+            partial_fub TEXT,
+            last_update TIMESTAMPTZ
+        );
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS sync_logs (
+            id SERIAL PRIMARY KEY,
+            fub_id BIGINT,
+            action TEXT,
+            origin TEXT,
+            timestamp TIMESTAMPTZ,
+            notes TEXT
+        );
+        """)
+        conn.commit()
+        logging.info("✅ Verified schema exists.")
 
-def batched_query(conn, sql, ids):
-    out = set()
-    for i in range(0, len(ids), BATCH_LOOKUP):
-        with conn.cursor() as cur:
-            cur.execute(sql, (ids[i:i+BATCH_LOOKUP],))
-            out |= {r[0] for r in cur.fetchall()}
-    return out
 
-def get_hashes(conn, ids):
-    out = {}
-    for i in range(0, len(ids), BATCH_LOOKUP):
-        with conn.cursor() as cur:
-            cur.execute("SELECT fub_id, full_hash FROM contact_hashes WHERE fub_id = ANY(%s)",
-                        (ids[i:i+BATCH_LOOKUP],))
-            for fid, fh in cur.fetchall():
-                out[fid] = fh
-    return out
-
-def upsert_all(conn, contacts, hashes, logs):
-    with conn.cursor() as cur:
-        if contacts:
-            execute_batch(cur, """
-                INSERT INTO contacts_master(
-                  fub_id, first_name, last_name, email, phone,
-                  street, city, state, zip, fub_url, ghl_url,
-                  stage, source, last_sync
-                )
-                VALUES(
-                  %(fub_id)s, %(first_name)s, %(last_name)s, %(email)s, %(phone)s,
-                  %(street)s, %(city)s, %(state)s, %(zip)s,
-                  %(fub_url)s, %(ghl_url)s,
-                  %(stage)s, %(source)s, %(last_sync)s
-                )
-                ON CONFLICT(fub_id) DO UPDATE SET
-                  first_name=EXCLUDED.first_name,
-                  last_name=EXCLUDED.last_name,
-                  email=EXCLUDED.email,
-                  phone=EXCLUDED.phone,
-                  street=EXCLUDED.street,
-                  city=EXCLUDED.city,
-                  state=EXCLUDED.state,
-                  zip=EXCLUDED.zip,
-                  fub_url=EXCLUDED.fub_url,
-                  ghl_url=EXCLUDED.ghl_url,
-                  stage=EXCLUDED.stage,
-                  source=EXCLUDED.source,
-                  last_sync=EXCLUDED.last_sync;
-            """, contacts, page_size=500)
-        if hashes:
-            execute_batch(cur, """
-                INSERT INTO contact_hashes(fub_id, full_hash, partial_fub, last_update)
-                VALUES(%(fub_id)s, %(full_hash)s, %(partial_fub)s, %(last_update)s)
-                ON CONFLICT(fub_id) DO UPDATE SET
-                  full_hash=EXCLUDED.full_hash,
-                  partial_fub=EXCLUDED.partial_fub,
-                  last_update=EXCLUDED.last_update;
-            """, hashes, page_size=500)
-        if logs:
-            execute_batch(cur, """
-                INSERT INTO sync_logs(fub_id, action, origin, timestamp, notes)
-                VALUES(%(fub_id)s, %(action)s, %(origin)s, %(timestamp)s, %(notes)s);
-            """, logs, page_size=500)
-    logging.info(f"✅ wrote {len(contacts)} contacts, {len(hashes)} hashes, {len(logs)} logs.")
-
-# ---------------------------------------------------------------------------
-# HASHING
-# ---------------------------------------------------------------------------
-def hash_full(c):
-    addr = c.get("primaryAddress") or {}
-    fields = [
-        c.get("firstName", ""), c.get("lastName", ""), c.get("primaryEmail", ""),
-        c.get("primaryPhoneNumber", ""), c.get("stage", ""), c.get("source", ""),
-        addr.get("street", ""), addr.get("city", ""), addr.get("state", ""), addr.get("postalCode", "")
+def compute_contact_hash(contact):
+    """Create a deterministic hash for FUB contact."""
+    key_fields = [
+        contact.get("firstName", ""),
+        contact.get("lastName", ""),
+        contact.get("primaryEmail", ""),
+        contact.get("primaryPhoneNumber", "")
     ]
-    return hashlib.sha256("|".join(fields).encode()).hexdigest()
+    raw = "|".join(key_fields)
+    return hashlib.sha256(raw.encode()).hexdigest()
 
-def hash_partial(c):
-    f = [c.get("firstName",""), c.get("lastName",""), c.get("primaryEmail","")]
-    return hashlib.md5("|".join(f).encode()).hexdigest()
 
-# ---------------------------------------------------------------------------
-# FUB API
-# ---------------------------------------------------------------------------
-def get_page(page):
-    url = "https://api.followupboss.com/v1/people"
-    params = {"limit": PAGE_SIZE, "page": page}
-    r = requests.get(url, params=params, auth=(FUB_API_KEY, ""), timeout=30)
-    if r.status_code != 200:
-        logging.error(f"❌ FUB API {r.status_code}: {r.text[:200]}")
-        return []
-    data = r.json()
-    return data.get("people") or data.get("contacts") or []
+def compute_partial_hash(contact):
+    """Smaller hash used for quick comparison."""
+    return hashlib.md5(
+        (contact.get("primaryEmail", "") + contact.get("primaryPhoneNumber", "")).encode()
+    ).hexdigest()
 
-# ---------------------------------------------------------------------------
+
+def get_existing_hashes(conn, fub_ids):
+    """Return dict {fub_id: hash} for known contacts."""
+    if not fub_ids:
+        return {}
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT fub_id, full_hash FROM contact_hashes WHERE fub_id = ANY(%s);",
+            (fub_ids,)
+        )
+        return {row[0]: row[1] for row in cur.fetchall()}
+
+
+def bulk_upsert(conn, contacts, hashes, logs):
+    """Upsert contacts, hashes, and logs in one transaction."""
+    with conn.cursor() as cur:
+        for c in contacts:
+            cur.execute("""
+                INSERT INTO contacts_master (
+                    fub_id, first_name, last_name, email, phone, street, city, state, zip,
+                    stage, source, fub_url, ghl_url, last_sync
+                )
+                VALUES (%(fub_id)s, %(first_name)s, %(last_name)s, %(email)s, %(phone)s,
+                        %(street)s, %(city)s, %(state)s, %(zip)s, %(stage)s, %(source)s,
+                        %(fub_url)s, %(ghl_url)s, %(last_sync)s)
+                ON CONFLICT (fub_id) DO UPDATE SET
+                    first_name=EXCLUDED.first_name,
+                    last_name=EXCLUDED.last_name,
+                    email=EXCLUDED.email,
+                    phone=EXCLUDED.phone,
+                    street=EXCLUDED.street,
+                    city=EXCLUDED.city,
+                    state=EXCLUDED.state,
+                    zip=EXCLUDED.zip,
+                    stage=EXCLUDED.stage,
+                    source=EXCLUDED.source,
+                    fub_url=EXCLUDED.fub_url,
+                    last_sync=EXCLUDED.last_sync;
+            """, c)
+
+        for h in hashes:
+            cur.execute("""
+                INSERT INTO contact_hashes (fub_id, full_hash, partial_fub, last_update)
+                VALUES (%(fub_id)s, %(full_hash)s, %(partial_fub)s, %(last_update)s)
+                ON CONFLICT (fub_id) DO UPDATE SET
+                    full_hash=EXCLUDED.full_hash,
+                    partial_fub=EXCLUDED.partial_fub,
+                    last_update=EXCLUDED.last_update;
+            """, h)
+
+        for l in logs:
+            cur.execute("""
+                INSERT INTO sync_logs (fub_id, action, origin, timestamp, notes)
+                VALUES (%(fub_id)s, %(action)s, %(origin)s, %(timestamp)s, %(notes)s);
+            """, l)
+
+        conn.commit()
+        logging.info(f"✅ Wrote {len(contacts)} contacts, {len(hashes)} hashes, {len(logs)} logs.")
+
+
+# ---------------------------------------------------------
+# FUB API CALLS
+# ---------------------------------------------------------
+def get_fub_contacts(page: int):
+    """Retrieve a page of contacts from FUB."""
+    headers = {"Accept": "application/json"}
+    response = requests.get(
+        FUB_BASE_URL,
+        auth=(FUB_API_KEY, ""),  # ✅ Works with previous valid auth
+        params={"page": page, "limit": 100}
+    )
+    if response.status_code != 200:
+        logging.error(f"❌ FUB API {response.status_code}: {response.text}")
+        return None
+    data = response.json()
+    return data.get("people", [])
+
+
+# ---------------------------------------------------------
 # MAIN BACKFILL
-# ---------------------------------------------------------------------------
+# ---------------------------------------------------------
 def run_backfill():
-    run = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    logging.info(f"🚀 Starting FUB → Render backfill [RUN {run}]")
-
-    conn = get_db()
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    logging.info(f"🚀 Starting FUB → Render backfill [RUN {run_id}]")
+    conn = get_db_connection()
     ensure_schema(conn)
 
-    total_proc, total_chg = 0, 0
+    total_processed = 0
+    total_changed = 0
+    page = 1
+    max_pages = 1000
 
     try:
-        for page in range(1, MAX_PAGES + 1):
-            people = get_page(page)
-            if not people:
-                logging.info(f"[RUN {run}] No contacts on page {page}. Ending cleanly.")
+        while page <= max_pages:
+            contacts = get_fub_contacts(page)
+            if not contacts:
+                logging.info(f"[RUN {run_id}] No more contacts at page {page}. Ending.")
                 break
 
-            ids = [p["id"] for p in people if p.get("id")]
-            hashes = get_hashes(conn, ids)
-            masters = batched_query(conn, "SELECT fub_id FROM contacts_master WHERE fub_id = ANY(%s)", ids)
+            fub_ids = [c["id"] for c in contacts if "id" in c]
+            existing_hashes = get_existing_hashes(conn, fub_ids)
+            contacts_batch, hashes_batch, logs_batch = [], [], []
+            changed_count = 0
 
-            contacts, new_hashes, logs = [], [], []
-            changed = 0
+            for c in contacts:
+                fub_id = c["id"]
+                full_hash = compute_contact_hash(c)
+                old_hash = existing_hashes.get(fub_id)
 
-            for c in people:
-                fid = c["id"]
-                fh = hash_full(c)
-                missing = fid not in masters
-                changed_now = missing or fh != hashes.get(fid)
-                if changed_now:
-                    changed += 1
-                    contacts.append({
-                        "fub_id": fid,
-                        "first_name": c.get("firstName",""),
-                        "last_name": c.get("lastName",""),
-                        "email": c.get("primaryEmail",""),
-                        "phone": c.get("primaryPhoneNumber",""),
-                        "street": c.get("primaryAddress",{}).get("street",""),
-                        "city": c.get("primaryAddress",{}).get("city",""),
-                        "state": c.get("primaryAddress",{}).get("state",""),
-                        "zip": c.get("primaryAddress",{}).get("postalCode",""),
-                        "fub_url": c.get("url",""),
+                if old_hash != full_hash:
+                    changed_count += 1
+                    contact_row = {
+                        "fub_id": fub_id,
+                        "first_name": c.get("firstName", ""),
+                        "last_name": c.get("lastName", ""),
+                        "email": c.get("primaryEmail", ""),
+                        "phone": c.get("primaryPhoneNumber", ""),
+                        "street": c.get("primaryAddress", {}).get("street", "") if c.get("primaryAddress") else "",
+                        "city": c.get("primaryAddress", {}).get("city", "") if c.get("primaryAddress") else "",
+                        "state": c.get("primaryAddress", {}).get("state", "") if c.get("primaryAddress") else "",
+                        "zip": c.get("primaryAddress", {}).get("postalCode", "") if c.get("primaryAddress") else "",
+                        "stage": c.get("stage", ""),
+                        "source": c.get("source", ""),
+                        "fub_url": c.get("url", ""),
                         "ghl_url": None,
-                        "stage": c.get("stage",""),
-                        "source": c.get("source",""),
                         "last_sync": datetime.now(timezone.utc)
-                    })
-                    new_hashes.append({
-                        "fub_id": fid,
-                        "full_hash": fh,
-                        "partial_fub": hash_partial(c),
+                    }
+                    hash_row = {
+                        "fub_id": fub_id,
+                        "full_hash": full_hash,
+                        "partial_fub": compute_partial_hash(c),
                         "last_update": datetime.now(timezone.utc)
-                    })
-                    logs.append({
-                        "fub_id": fid,
-                        "action": "UPSERT" if missing else "UPDATE",
+                    }
+                    log_row = {
+                        "fub_id": fub_id,
+                        "action": "UPSERT",
                         "origin": "backfill",
                         "timestamp": datetime.now(timezone.utc),
-                        "notes": "Inserted new row" if missing else "Hash changed"
-                    })
+                        "notes": f"Updated contact {fub_id}"
+                    }
 
-            if changed:
-                upsert_all(conn, contacts, new_hashes, logs)
-                total_chg += changed
+                    contacts_batch.append(contact_row)
+                    hashes_batch.append(hash_row)
+                    logs_batch.append(log_row)
 
-            total_proc += len(people)
-            logging.info(f"[RUN {run}] Page {page}: processed={len(people)} changed={changed} "
-                         f"→ total_processed={total_proc} total_changed={total_chg}")
+            if changed_count > 0:
+                bulk_upsert(conn, contacts_batch, hashes_batch, logs_batch)
+                total_changed += changed_count
 
-            if len(people) < PAGE_SIZE:
-                logging.info(f"[RUN {run}] End of data reached.")
+            total_processed += len(contacts)
+            logging.info(
+                f"[RUN {run_id}] Page {page:>3}: processed={len(contacts):<4} changed={changed_count:<4} "
+                f"→ total_processed={total_processed:<6} total_changed={total_changed:<6}"
+            )
+
+            if len(contacts) < 100:
+                logging.info(f"[RUN {run_id}] Reached end of available contacts.")
                 break
 
-        logging.info(f"✅ [RUN {run}] Finished. Total processed={total_proc}, changed={total_chg}")
+            page += 1
+
+        logging.info(f"✅ [RUN {run_id}] Backfill complete: total_processed={total_processed}, total_changed={total_changed}")
 
     except Exception as e:
-        logging.exception(f"❌ [RUN {run}] Failed: {e}")
+        logging.exception(f"Backfill failed: {e}")
     finally:
         conn.close()
-        logging.info(f"[RUN {run}] Database connection closed.")
-        logging.info("🏁 Backfill run complete. Exiting normally.")
+        logging.info(f"[RUN {run_id}] Database connection closed.")
 
-# ---------------------------------------------------------------------------
+
 if __name__ == "__main__":
     run_backfill()
