@@ -4,6 +4,7 @@ import psycopg2
 import hashlib
 import logging
 from datetime import datetime, timezone
+import urllib.parse as up
 
 # ---------------------------------------------------------
 # CONFIG
@@ -11,13 +12,27 @@ from datetime import datetime, timezone
 FUB_API_KEY = os.getenv("FUB_API_KEY")
 FUB_BASE_URL = "https://api.followupboss.com/v1/people"
 
-DB_CONN = {
-    "dbname": os.getenv("POSTGRES_DB"),
-    "user": os.getenv("POSTGRES_USER"),
-    "password": os.getenv("POSTGRES_PASSWORD"),
-    "host": os.getenv("POSTGRES_HOST"),
-    "port": os.getenv("POSTGRES_PORT", 5432)
-}
+# ✅ Render-proof DB connection
+def get_db_connection():
+    db_url = os.getenv("DATABASE_URL")
+    if db_url:
+        up.uses_netloc.append("postgres")
+        url = up.urlparse(db_url)
+        return psycopg2.connect(
+            dbname=url.path[1:],
+            user=url.username,
+            password=url.password,
+            host=url.hostname,
+            port=url.port or 5432
+        )
+    # Fallback to individual vars (legacy)
+    return psycopg2.connect(
+        dbname=os.getenv("POSTGRES_DB"),
+        user=os.getenv("POSTGRES_USER"),
+        password=os.getenv("POSTGRES_PASSWORD"),
+        host=os.getenv("POSTGRES_HOST"),
+        port=os.getenv("POSTGRES_PORT", 5432)
+    )
 
 # ---------------------------------------------------------
 # LOGGING
@@ -30,9 +45,6 @@ logging.basicConfig(
 # ---------------------------------------------------------
 # DATABASE HELPERS
 # ---------------------------------------------------------
-def get_db_connection():
-    return psycopg2.connect(**DB_CONN)
-
 def ensure_schema(conn):
     with conn.cursor() as cur:
         cur.execute("""
@@ -76,26 +88,22 @@ def ensure_schema(conn):
 
 
 def compute_contact_hash(contact):
-    """Create a deterministic hash for FUB contact."""
     key_fields = [
         contact.get("firstName", ""),
         contact.get("lastName", ""),
         contact.get("primaryEmail", ""),
         contact.get("primaryPhoneNumber", "")
     ]
-    raw = "|".join(key_fields)
-    return hashlib.sha256(raw.encode()).hexdigest()
+    return hashlib.sha256("|".join(key_fields).encode()).hexdigest()
 
 
 def compute_partial_hash(contact):
-    """Smaller hash used for quick comparison."""
     return hashlib.md5(
         (contact.get("primaryEmail", "") + contact.get("primaryPhoneNumber", "")).encode()
     ).hexdigest()
 
 
 def get_existing_hashes(conn, fub_ids):
-    """Return dict {fub_id: hash} for known contacts."""
     if not fub_ids:
         return {}
     with conn.cursor() as cur:
@@ -107,7 +115,6 @@ def get_existing_hashes(conn, fub_ids):
 
 
 def bulk_upsert(conn, contacts, hashes, logs):
-    """Upsert contacts, hashes, and logs in one transaction."""
     with conn.cursor() as cur:
         for c in contacts:
             cur.execute("""
@@ -157,11 +164,10 @@ def bulk_upsert(conn, contacts, hashes, logs):
 # FUB API CALLS
 # ---------------------------------------------------------
 def get_fub_contacts(page: int):
-    """Retrieve a page of contacts from FUB."""
     headers = {"Accept": "application/json"}
     response = requests.get(
         FUB_BASE_URL,
-        auth=(FUB_API_KEY, ""),  # ✅ Works with previous valid auth
+        auth=(FUB_API_KEY, ""),
         params={"page": page, "limit": 100}
     )
     if response.status_code != 200:
@@ -183,7 +189,7 @@ def run_backfill():
     total_processed = 0
     total_changed = 0
     page = 1
-    max_pages = 1000
+    max_pages = 200  # enough for ~20,000 records
 
     try:
         while page <= max_pages:
