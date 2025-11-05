@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from psycopg2.extras import execute_batch
 
 # ------------------------------------------------------------------------------
-# CONFIG
+# CONFIGURATION
 # ------------------------------------------------------------------------------
 
 FUB_API_KEY = os.getenv("FUB_API_KEY") or os.getenv("FUB_KEY") or os.getenv("FUB_TOKEN")
@@ -84,7 +84,7 @@ def ensure_schema(conn):
 
 
 # ------------------------------------------------------------------------------
-# FOLLOW UP BOSS API
+# FOLLOW UP BOSS API (LEGACY PAGINATION)
 # ------------------------------------------------------------------------------
 
 def fub_headers() -> dict:
@@ -96,28 +96,43 @@ def fub_headers() -> dict:
     }
 
 
-def fetch_all_contacts() -> list:
+def fetch_all_contacts(limit: int = 100) -> list:
     """
-    Use the /v1/export/people endpoint for full export of all contacts.
-    This endpoint returns a complete JSON dump of all contacts.
+    Paginate using ?limit=100&page=n until no more results are returned.
+    Works for standard FUB API keys (no export/cursor access needed).
     """
-    url = f"{FUB_BASE_URL.rstrip('/')}/v1/export/people"
-    logging.info(f"📡 Fetching all contacts from {url}")
+    url = f"{FUB_BASE_URL.rstrip('/')}/v1/people"
+    all_contacts = []
+    page = 1
 
-    try:
-        resp = requests.get(url, headers=fub_headers(), timeout=300)
+    while True:
+        params = {"limit": limit, "page": page}
+        logging.info(f"📡 Fetching page {page} from {url}")
+        resp = requests.get(url, headers=fub_headers(), params=params, timeout=60)
+
         if resp.status_code != 200:
             logging.error(f"❌ FUB API Error {resp.status_code}: {resp.text}")
-            return []
+            break
 
         data = resp.json()
-        people = data.get("people") or data.get("items") or data
-        logging.info(f"✅ Received {len(people)} total contacts.")
-        return people
+        people = data.get("people") or data.get("items") or data.get("contacts") or []
 
-    except Exception as e:
-        logging.exception(f"Error fetching contacts: {e}")
-        return []
+        if not people:
+            logging.info(f"✅ Completed: no more data after page {page}.")
+            break
+
+        all_contacts.extend(people)
+        logging.info(f"📄 Page {page}: fetched {len(people)} contacts (total={len(all_contacts)})")
+
+        if len(people) < limit:
+            logging.info(f"✅ Final page {page} ({len(people)} records).")
+            break
+
+        page += 1
+        time.sleep(0.2)  # API rate-limit protection
+
+    logging.info(f"✅ Received total {len(all_contacts)} contacts.")
+    return all_contacts
 
 
 # ------------------------------------------------------------------------------
@@ -292,14 +307,12 @@ def run_backfill():
 
         total_processed += 1
 
-        # Write in chunks
         if len(contact_batch) >= 500:
             bulk_upsert(conn, contact_batch, hash_batch, log_batch)
             contact_batch.clear()
             hash_batch.clear()
             log_batch.clear()
 
-    # Final flush
     bulk_upsert(conn, contact_batch, hash_batch, log_batch)
 
     logging.info(
