@@ -2,12 +2,12 @@ import os
 import psycopg2
 import requests
 import hashlib
-from datetime import datetime
-from urllib.parse import urljoin
+import base64
+from datetime import datetime, timezone
 
 # === ENVIRONMENT CONFIG ===
 FUB_API_KEY = os.getenv("FUB_API_KEY")
-DB_URL = os.getenv("DATABASE_URL")  # full postgres:// URI from Render
+DB_URL = os.getenv("DATABASE_URL")  # Full postgres:// URI from Render
 X_SYSTEM_NAME = os.getenv("FUB_SYSTEM", "x-system")
 X_SYSTEM_KEY = os.getenv("FUB_SYSTEM_KEY", "test-key")
 
@@ -18,7 +18,7 @@ BATCH_LIMIT = 10000  # safety cap for full runs
 
 # === LOGGING ===
 def log(msg: str):
-    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} [INFO] {msg}")
+    print(f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} [INFO] {msg}")
 
 # === HASHING ===
 def compute_hash(record: dict) -> str:
@@ -64,12 +64,15 @@ def ensure_tables():
 
 # === FUB API ===
 def fetch_people(url: str):
-    """Fetch a single page of people from FUB."""
+    """Fetch a single page of people from FUB using proper Basic Auth."""
+    encoded_auth = base64.b64encode(f"{FUB_API_KEY}:".encode("utf-8")).decode("utf-8")
+
     headers = {
-        "Authorization": "Basic " + requests.utils.quote(f"{FUB_API_KEY}:"),
+        "Authorization": f"Basic {encoded_auth}",
         "X-System": X_SYSTEM_NAME,
         "X-System-Key": X_SYSTEM_KEY,
     }
+
     resp = requests.get(url, headers=headers)
     if resp.status_code != 200:
         log(f"❌ Error {resp.status_code}: {resp.text}")
@@ -101,7 +104,7 @@ def write_batch_to_db(records, conn, run_id):
                     stage = EXCLUDED.stage,
                     source = EXCLUDED.source,
                     updated_at = EXCLUDED.updated_at;
-            """, (fub_id, name, email, phone, stage, source, datetime.utcnow()))
+            """, (fub_id, name, email, phone, stage, source, datetime.now(timezone.utc)))
 
             # Hash tracking
             h = compute_hash(p)
@@ -110,13 +113,13 @@ def write_batch_to_db(records, conn, run_id):
                 VALUES (%s,%s,%s)
                 ON CONFLICT (fub_id) DO UPDATE
                 SET data_hash = EXCLUDED.data_hash, updated_at = EXCLUDED.updated_at;
-            """, (fub_id, h, datetime.utcnow()))
+            """, (fub_id, h, datetime.now(timezone.utc)))
 
             # Log entry
             cur.execute("""
                 INSERT INTO sync_logs (fub_id, action, run_id, created_at)
                 VALUES (%s,%s,%s,%s)
-            """, (fub_id, "backfill", run_id, datetime.utcnow()))
+            """, (fub_id, "backfill", run_id, datetime.now(timezone.utc)))
     conn.commit()
 
 # === MAIN ===
@@ -127,7 +130,7 @@ def run_full_backfill():
     total_processed = 0
     page = 1
     next_link = f"{BASE_URL}?limit={PAGE_SIZE}"
-    run_id = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
 
     while next_link and total_processed < BATCH_LIMIT:
         log(f"📦 Fetching Page {page}: {next_link}")
