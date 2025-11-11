@@ -3,7 +3,7 @@ import psycopg2
 import requests
 import hashlib
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 
 # ---------------------------------------------------
 # CONFIGURATION
@@ -11,38 +11,57 @@ from datetime import datetime
 DATABASE_URL = os.getenv("DATABASE_URL")
 FUB_API_KEY = os.getenv("FUB_API_KEY")
 PAGE_LIMIT = 100
+STATE_FILE = "fub_pagination_state.json"  # remembers where it left off
 
 # ---------------------------------------------------
 # HELPERS
 # ---------------------------------------------------
 def log(msg):
-    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} [INFO] {msg}")
+    """Simple structured logging"""
+    print(f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} [INFO] {msg}")
 
 def hash_contact(contact):
-    """Generate a stable hash of contact data"""
+    """Generate deterministic SHA256 hash for data integrity checks"""
     relevant_fields = [
         contact.get("firstName", ""),
         contact.get("lastName", ""),
         contact.get("email", ""),
         contact.get("phone", ""),
         contact.get("stage", ""),
-        contact.get("source", ""),
+        contact.get("source", "")
     ]
     data_string = "|".join(map(str, relevant_fields))
     return hashlib.sha256(data_string.encode("utf-8")).hexdigest()
 
+def save_state(next_link):
+    """Persist pagination state so backfill can resume"""
+    state = {"next_link": next_link, "timestamp": datetime.now(timezone.utc).isoformat()}
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f)
+    log(f"💾 Saved state with next_link: {next_link}")
+
+def load_state():
+    """Restore pagination state if file exists"""
+    if not os.path.exists(STATE_FILE):
+        return None
+    with open(STATE_FILE, "r") as f:
+        state = json.load(f)
+    return state.get("next_link")
+
 # ---------------------------------------------------
-# DATABASE OPERATIONS
+# DATABASE
 # ---------------------------------------------------
 def bulk_upsert(conn, contacts, hashes, logs):
-    """Insert or update master, hash, and log records in bulk."""
+    """Efficient bulk UPSERT into all three tables"""
     with conn.cursor() as cur:
         # contacts_master
         cur.executemany("""
             INSERT INTO contacts_master (
-                fub_id, first_name, last_name, email, phone, street, city, state, zip,
-                fub_url, ghl_url, stage, source, last_sync, full_name, updated_at
-            ) VALUES (
+                fub_id, first_name, last_name, email, phone,
+                street, city, state, zip, fub_url, ghl_url,
+                stage, source, last_sync, full_name, updated_at
+            )
+            VALUES (
                 %(fub_id)s, %(first_name)s, %(last_name)s, %(email)s, %(phone)s,
                 %(street)s, %(city)s, %(state)s, %(zip)s, %(fub_url)s, %(ghl_url)s,
                 %(stage)s, %(source)s, %(last_sync)s, %(full_name)s, %(updated_at)s
@@ -77,12 +96,12 @@ def bulk_upsert(conn, contacts, hashes, logs):
     conn.commit()
 
 # ---------------------------------------------------
-# FOLLOWUPBOSS API
+# FUB API
 # ---------------------------------------------------
-def fetch_all_people(api_key, limit=100):
-    """Paginate through all people using 'next' cursor"""
+def fetch_all_people(api_key, limit=100, resume_from=None):
+    """Paginate through all people using nextLink (preferred) or next token."""
     base_url = "https://api.followupboss.com/v1/people"
-    next_url = f"{base_url}?limit={limit}"
+    next_url = resume_from or f"{base_url}?limit={limit}"
     total_fetched = 0
     page = 0
 
@@ -96,26 +115,28 @@ def fetch_all_people(api_key, limit=100):
         if not people:
             break
 
-        yield people, page
-        total_fetched += len(people)
         page += 1
-
-        # Show first & last IDs for sanity
+        total_fetched += len(people)
         first_id, last_id = people[0]["id"], people[-1]["id"]
-        log(f"Page {page}: first_id={first_id}, last_id={last_id}, fetched={len(people)}")
+        log(f"📦 Page {page}: first_id={first_id}, last_id={last_id}, fetched={len(people)} (total={total_fetched})")
 
-        next_token = data.get("next")
-        next_url = f"{base_url}?limit={limit}&next={next_token}" if next_token else None
+        yield people, page
+
+        # Choose next URL
+        next_url = data.get("nextLink") or (
+            f"{base_url}?limit={limit}&next={data.get('next')}" if data.get("next") else None
+        )
+
+        save_state(next_url if next_url else "COMPLETED")
 
     log(f"✅ Completed fetch. Total people fetched: {total_fetched}")
 
 # ---------------------------------------------------
-# MAIN BACKFILL
+# MAIN
 # ---------------------------------------------------
 def run_backfill():
     log("🚀 Starting FUB → Render backfill")
 
-    # Database connection
     conn = psycopg2.connect(DATABASE_URL)
     log("🔗 Connected to database.")
 
@@ -123,7 +144,11 @@ def run_backfill():
     total_changed = 0
 
     try:
-        for people, page in fetch_all_people(FUB_API_KEY, PAGE_LIMIT):
+        resume_from = load_state()
+        if resume_from:
+            log(f"⏩ Resuming from saved cursor: {resume_from}")
+
+        for people, page in fetch_all_people(FUB_API_KEY, PAGE_LIMIT, resume_from):
             contact_batch = []
             hash_batch = []
             log_batch = []
@@ -140,7 +165,7 @@ def run_backfill():
 
                 full_name = f"{first_name or ''} {last_name or ''}".strip()
                 data_hash = hash_contact(person)
-                timestamp = datetime.utcnow()
+                timestamp = datetime.now(timezone.utc)
 
                 contact_batch.append({
                     "fub_id": fub_id,
@@ -174,14 +199,15 @@ def run_backfill():
                     "action": "UPSERT",
                     "origin": "fub_backfill",
                     "timestamp": timestamp,
-                    "notes": f"Upserted via page {page}"
+                    "notes": f"Upserted on page {page}"
                 })
 
             bulk_upsert(conn, contact_batch, hash_batch, log_batch)
             total_processed += len(contact_batch)
             total_changed += len(contact_batch)
+            log(f"✅ Wrote {len(contact_batch)} contacts, total_processed={total_processed}")
 
-            log(f"✅ Wrote {len(contact_batch)} contacts, {len(log_batch)} logs → total_processed={total_processed}")
+        log("🏁 Backfill run complete.")
 
     except Exception as e:
         log(f"❌ Error during backfill: {e}")
@@ -191,7 +217,7 @@ def run_backfill():
         log(f"✅ Backfill complete: total_processed={total_processed}, total_changed={total_changed}")
 
 # ---------------------------------------------------
-# ENTRY POINT
+# ENTRY
 # ---------------------------------------------------
 if __name__ == "__main__":
     run_backfill()
