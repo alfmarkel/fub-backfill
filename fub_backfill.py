@@ -1,39 +1,39 @@
 import os
-import psycopg2
 import requests
+import psycopg2
 import hashlib
-import base64
 from datetime import datetime, timezone
 
-# === ENVIRONMENT CONFIG ===
+# ------------------------------------------------------------
+# ENVIRONMENT VARIABLES
+# ------------------------------------------------------------
 FUB_API_KEY = os.getenv("FUB_API_KEY")
-DB_URL = os.getenv("DATABASE_URL")  # Full postgres:// URI from Render
-X_SYSTEM_NAME = os.getenv("FUB_SYSTEM", "x-system")
-X_SYSTEM_KEY = os.getenv("FUB_SYSTEM_KEY", "test-key")
+FUB_SYSTEM_KEY = os.getenv("FUB_SYSTEM_KEY", "x-system")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-# === CONSTANTS ===
-BASE_URL = "https://api.followupboss.com/v1/people"
-PAGE_SIZE = 100
-BATCH_LIMIT = 10000  # safety cap for full runs
-
-# === LOGGING ===
-def log(msg: str):
+# ------------------------------------------------------------
+# LOGGING UTILITY
+# ------------------------------------------------------------
+def log(msg):
     print(f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} [INFO] {msg}")
 
-# === HASHING ===
-def compute_hash(record: dict) -> str:
-    """Compute a hash for change detection."""
-    raw = "|".join([str(record.get(k, "")) for k in sorted(record.keys())])
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-# === DATABASE ===
+# ------------------------------------------------------------
+# DATABASE CONNECTION
+# ------------------------------------------------------------
 def get_connection():
-    return psycopg2.connect(DB_URL)
+    conn = psycopg2.connect(DATABASE_URL)
+    conn.autocommit = True
+    return conn
 
+# ------------------------------------------------------------
+# TABLE CREATION / VALIDATION
+# ------------------------------------------------------------
 def ensure_tables():
     with get_connection() as conn, conn.cursor() as cur:
+        # Force correct schema and heal missing columns
+        cur.execute("SET search_path TO public;")
         cur.execute("""
-        CREATE TABLE IF NOT EXISTS contacts_master (
+        CREATE TABLE IF NOT EXISTS public.contacts_master (
             fub_id BIGINT PRIMARY KEY,
             full_name TEXT,
             email TEXT,
@@ -44,14 +44,14 @@ def ensure_tables():
         );
         """)
         cur.execute("""
-        CREATE TABLE IF NOT EXISTS contact_hashes (
+        CREATE TABLE IF NOT EXISTS public.contact_hashes (
             fub_id BIGINT PRIMARY KEY,
             data_hash TEXT,
             updated_at TIMESTAMP
         );
         """)
         cur.execute("""
-        CREATE TABLE IF NOT EXISTS sync_logs (
+        CREATE TABLE IF NOT EXISTS public.sync_logs (
             id SERIAL PRIMARY KEY,
             fub_id BIGINT,
             action TEXT,
@@ -59,100 +59,125 @@ def ensure_tables():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         """)
+
+        # Auto-heal schema if somehow desynced
+        cur.execute("ALTER TABLE public.contact_hashes ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP;")
         conn.commit()
-        log("✅ Tables verified or created.")
+        log("✅ Tables verified or created in public schema.")
 
-# === FUB API ===
-def fetch_people(url: str):
-    """Fetch a single page of people from FUB using proper Basic Auth."""
-    encoded_auth = base64.b64encode(f"{FUB_API_KEY}:".encode("utf-8")).decode("utf-8")
-
+# ------------------------------------------------------------
+# FETCH DATA FROM FOLLOWUPBOSS
+# ------------------------------------------------------------
+def fetch_page(url):
     headers = {
-        "Authorization": f"Basic {encoded_auth}",
-        "X-System": X_SYSTEM_NAME,
-        "X-System-Key": X_SYSTEM_KEY,
+        "Authorization": f"Basic {FUB_API_KEY}:",
+        "X-System": FUB_SYSTEM_KEY
     }
-
-    resp = requests.get(url, headers=headers)
-    if resp.status_code != 200:
-        log(f"❌ Error {resp.status_code}: {resp.text}")
+    res = requests.get(url, headers=headers)
+    if res.status_code != 200:
+        log(f"❌ Error {res.status_code}: {res.text}")
         return None
-    return resp.json()
+    return res.json()
 
-# === WRITE ===
-def write_batch_to_db(records, conn, run_id):
-    """Write contacts and logs to DB."""
-    if not records:
-        return
+# ------------------------------------------------------------
+# HASHING UTILITY
+# ------------------------------------------------------------
+def compute_hash(person):
+    m = hashlib.sha256()
+    fields = [
+        str(person.get("id", "")),
+        person.get("name", ""),
+        str(person.get("emails", [])),
+        str(person.get("phones", [])),
+        person.get("stage", ""),
+        person.get("source", ""),
+    ]
+    m.update("|".join(fields).encode("utf-8"))
+    return m.hexdigest()
+
+# ------------------------------------------------------------
+# WRITE TO DATABASE
+# ------------------------------------------------------------
+def write_batch_to_db(people, conn, run_id):
     with conn.cursor() as cur:
-        for p in records:
-            fub_id = p.get("id")
-            name = p.get("name")
-            email = p.get("emails", [{}])[0].get("value")
-            phone = p.get("phones", [{}])[0].get("value")
-            stage = p.get("stage")
-            source = p.get("source")
+        for person in people:
+            fub_id = person["id"]
+            full_name = person.get("name")
+            email = person.get("emails", [{}])[0].get("value") if person.get("emails") else None
+            phone = person.get("phones", [{}])[0].get("value") if person.get("phones") else None
+            stage = person.get("stage")
+            source = person.get("source")
+            h = compute_hash(person)
 
-            # Insert or update contact
+            # Upsert contact
             cur.execute("""
-                INSERT INTO contacts_master (fub_id, full_name, email, phone, stage, source, updated_at)
-                VALUES (%s,%s,%s,%s,%s,%s,%s)
-                ON CONFLICT (fub_id) DO UPDATE
-                SET full_name = EXCLUDED.full_name,
-                    email = EXCLUDED.email,
-                    phone = EXCLUDED.phone,
-                    stage = EXCLUDED.stage,
-                    source = EXCLUDED.source,
-                    updated_at = EXCLUDED.updated_at;
-            """, (fub_id, name, email, phone, stage, source, datetime.now(timezone.utc)))
+                INSERT INTO public.contacts_master (fub_id, full_name, email, phone, stage, source, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (fub_id)
+                DO UPDATE SET full_name = EXCLUDED.full_name,
+                              email = EXCLUDED.email,
+                              phone = EXCLUDED.phone,
+                              stage = EXCLUDED.stage,
+                              source = EXCLUDED.source,
+                              updated_at = EXCLUDED.updated_at;
+            """, (fub_id, full_name, email, phone, stage, source, datetime.now(timezone.utc)))
 
-            # Hash tracking
-            h = compute_hash(p)
+            # Upsert hash
             cur.execute("""
-                INSERT INTO contact_hashes (fub_id, data_hash, updated_at)
-                VALUES (%s,%s,%s)
-                ON CONFLICT (fub_id) DO UPDATE
-                SET data_hash = EXCLUDED.data_hash, updated_at = EXCLUDED.updated_at;
+                INSERT INTO public.contact_hashes (fub_id, data_hash, updated_at)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (fub_id)
+                DO UPDATE SET data_hash = EXCLUDED.data_hash,
+                              updated_at = EXCLUDED.updated_at;
             """, (fub_id, h, datetime.now(timezone.utc)))
 
-            # Log entry
+            # Log sync action
             cur.execute("""
-                INSERT INTO sync_logs (fub_id, action, run_id, created_at)
-                VALUES (%s,%s,%s,%s)
-            """, (fub_id, "backfill", run_id, datetime.now(timezone.utc)))
-    conn.commit()
+                INSERT INTO public.sync_logs (fub_id, action, run_id)
+                VALUES (%s, %s, %s);
+            """, (fub_id, "FUB_BACKFILL", run_id))
 
-# === MAIN ===
+        conn.commit()
+        log(f"✅ Wrote {len(people)} contacts to database.")
+
+# ------------------------------------------------------------
+# FULL BACKFILL EXECUTION
+# ------------------------------------------------------------
 def run_full_backfill():
     log("🚀 Starting FUB → Render full backfill")
     ensure_tables()
+
     conn = get_connection()
+    base_url = "https://api.followupboss.com/v1/people?limit=100"
+    next_url = base_url
     total_processed = 0
-    page = 1
-    next_link = f"{BASE_URL}?limit={PAGE_SIZE}"
     run_id = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
 
-    while next_link and total_processed < BATCH_LIMIT:
-        log(f"📦 Fetching Page {page}: {next_link}")
-        data = fetch_people(next_link)
-        if not data:
+    while next_url:
+        data = fetch_page(next_url)
+        if not data or "people" not in data:
             break
 
-        people = data.get("people", [])
-        meta = data.get("_metadata", {})
-        write_batch_to_db(people, conn, run_id)
+        people = data["people"]
+        if not people:
+            break
+
         total_processed += len(people)
+        write_batch_to_db(people, conn, run_id)
 
-        next_link = meta.get("nextLink")
-        page += 1
-        if not next_link:
-            log("🏁 No nextLink found — reached end of records.")
+        meta = data.get("_metadata", {})
+        next_url = meta.get("nextLink")
+        if next_url:
+            log(f"🔄 Next page → {next_url}")
+        else:
             break
 
-    log(f"✅ Completed backfill. Total records processed: {total_processed}")
     conn.close()
+    log(f"✅ Completed backfill. Total records processed: {total_processed}")
     log("🔒 Database connection closed.")
 
-# === ENTRY POINT ===
+# ------------------------------------------------------------
+# ENTRY POINT
+# ------------------------------------------------------------
 if __name__ == "__main__":
     run_full_backfill()
