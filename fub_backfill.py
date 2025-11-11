@@ -8,7 +8,6 @@ if not FUB_API_KEY:
 
 BASE_URL = "https://api.followupboss.com/v1/people?limit=100"
 
-
 def fetch_all_people():
     total_processed = 0
     page = 1
@@ -52,4 +51,5 @@ def fetch_all_people():
 
 if __name__ == "__main__":
     fetch_all_people()
+
 
