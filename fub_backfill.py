@@ -1,9 +1,13 @@
 import requests
+import os
 import time
 
-FUB_API_KEY = "your_api_key_here"  # or use os.getenv("FUB_API_KEY")
+FUB_API_KEY = os.getenv("FUB_API_KEY")
+if not FUB_API_KEY:
+    raise ValueError("❌ Missing FUB_API_KEY environment variable")
 
 BASE_URL = "https://api.followupboss.com/v1/people?limit=100"
+
 
 def fetch_all_people():
     total_processed = 0
@@ -48,3 +52,4 @@ def fetch_all_people():
 
 if __name__ == "__main__":
     fetch_all_people()
+
