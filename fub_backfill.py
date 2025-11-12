@@ -33,6 +33,7 @@ def ensure_tables():
     with get_connection() as conn, conn.cursor() as cur:
         cur.execute("SET search_path TO public;")
 
+        # contacts_master
         cur.execute("""
         CREATE TABLE IF NOT EXISTS public.contacts_master (
             fub_id BIGINT PRIMARY KEY,
@@ -45,6 +46,7 @@ def ensure_tables():
         );
         """)
 
+        # contact_hashes
         cur.execute("""
         CREATE TABLE IF NOT EXISTS public.contact_hashes (
             fub_id BIGINT PRIMARY KEY,
@@ -53,17 +55,24 @@ def ensure_tables():
         );
         """)
 
+        # sync_logs (aligned with your structure)
         cur.execute("""
         CREATE TABLE IF NOT EXISTS public.sync_logs (
-            id SERIAL PRIMARY KEY,
+            id BIGSERIAL PRIMARY KEY,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             fub_id BIGINT,
-            action TEXT,
             run_id TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            origin TEXT,
+            action TEXT,
+            notes TEXT
         );
         """)
 
+        # Schema safety
         cur.execute("ALTER TABLE public.contact_hashes ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP;")
+        cur.execute("ALTER TABLE public.sync_logs ADD COLUMN IF NOT EXISTS run_id TEXT;")
+        cur.execute("ALTER TABLE public.sync_logs ADD COLUMN IF NOT EXISTS origin TEXT;")
+        cur.execute("ALTER TABLE public.sync_logs ADD COLUMN IF NOT EXISTS notes TEXT;")
         conn.commit()
         log("✅ Tables verified or created in public schema.")
 
@@ -71,7 +80,6 @@ def ensure_tables():
 # FETCH DATA FROM FOLLOWUPBOSS
 # ------------------------------------------------------------
 def fetch_page(url):
-    # Correct Base64 encoding for FollowUpBoss Basic Auth
     auth_token = base64.b64encode(f"{FUB_API_KEY}:".encode()).decode()
     headers = {
         "Authorization": f"Basic {auth_token}",
@@ -133,10 +141,18 @@ def write_batch_to_db(people, conn, run_id):
                               updated_at = EXCLUDED.updated_at;
             """, (fub_id, h, datetime.now(timezone.utc)))
 
+            # Insert log entry respecting your actual columns
             cur.execute("""
-                INSERT INTO public.sync_logs (fub_id, action, run_id)
-                VALUES (%s, %s, %s);
-            """, (fub_id, "FUB_BACKFILL", run_id))
+                INSERT INTO public.sync_logs (timestamp, fub_id, run_id, origin, action, notes)
+                VALUES (%s, %s, %s, %s, %s, %s);
+            """, (
+                datetime.now(timezone.utc),
+                fub_id,
+                run_id,
+                "FUB_BACKFILL",
+                "contact_upsert",
+                "Synced during full backfill"
+            ))
 
         conn.commit()
         log(f"✅ Wrote {len(people)} contacts to database.")
