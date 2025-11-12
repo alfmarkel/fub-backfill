@@ -2,6 +2,7 @@ import os
 import requests
 import psycopg2
 import hashlib
+import base64
 from datetime import datetime, timezone
 
 # ------------------------------------------------------------
@@ -30,8 +31,8 @@ def get_connection():
 # ------------------------------------------------------------
 def ensure_tables():
     with get_connection() as conn, conn.cursor() as cur:
-        # Force correct schema and heal missing columns
         cur.execute("SET search_path TO public;")
+
         cur.execute("""
         CREATE TABLE IF NOT EXISTS public.contacts_master (
             fub_id BIGINT PRIMARY KEY,
@@ -43,6 +44,7 @@ def ensure_tables():
             updated_at TIMESTAMP
         );
         """)
+
         cur.execute("""
         CREATE TABLE IF NOT EXISTS public.contact_hashes (
             fub_id BIGINT PRIMARY KEY,
@@ -50,6 +52,7 @@ def ensure_tables():
             updated_at TIMESTAMP
         );
         """)
+
         cur.execute("""
         CREATE TABLE IF NOT EXISTS public.sync_logs (
             id SERIAL PRIMARY KEY,
@@ -60,7 +63,6 @@ def ensure_tables():
         );
         """)
 
-        # Auto-heal schema if somehow desynced
         cur.execute("ALTER TABLE public.contact_hashes ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP;")
         conn.commit()
         log("✅ Tables verified or created in public schema.")
@@ -69,8 +71,10 @@ def ensure_tables():
 # FETCH DATA FROM FOLLOWUPBOSS
 # ------------------------------------------------------------
 def fetch_page(url):
+    # Correct Base64 encoding for FollowUpBoss Basic Auth
+    auth_token = base64.b64encode(f"{FUB_API_KEY}:".encode()).decode()
     headers = {
-        "Authorization": f"Basic {FUB_API_KEY}:",
+        "Authorization": f"Basic {auth_token}",
         "X-System": FUB_SYSTEM_KEY
     }
     res = requests.get(url, headers=headers)
@@ -109,7 +113,6 @@ def write_batch_to_db(people, conn, run_id):
             source = person.get("source")
             h = compute_hash(person)
 
-            # Upsert contact
             cur.execute("""
                 INSERT INTO public.contacts_master (fub_id, full_name, email, phone, stage, source, updated_at)
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
@@ -122,7 +125,6 @@ def write_batch_to_db(people, conn, run_id):
                               updated_at = EXCLUDED.updated_at;
             """, (fub_id, full_name, email, phone, stage, source, datetime.now(timezone.utc)))
 
-            # Upsert hash
             cur.execute("""
                 INSERT INTO public.contact_hashes (fub_id, data_hash, updated_at)
                 VALUES (%s, %s, %s)
@@ -131,7 +133,6 @@ def write_batch_to_db(people, conn, run_id):
                               updated_at = EXCLUDED.updated_at;
             """, (fub_id, h, datetime.now(timezone.utc)))
 
-            # Log sync action
             cur.execute("""
                 INSERT INTO public.sync_logs (fub_id, action, run_id)
                 VALUES (%s, %s, %s);
